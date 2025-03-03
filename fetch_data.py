@@ -1,257 +1,440 @@
-# fetch_data.py
-import time
+# fetch_data.py (Updated)
+from config import API_KEY, API_SECRET, INTERVAL, HISTORICAL_DATA_PATH, SMA_FAST_PERIOD, SMA_SLOW_PERIOD, RSI_PERIOD, ATR_PERIOD, BOLINGER_PERIOD, BOLINGER_STD_DEV, MACD_FAST, MACD_SLOW, MACD_SIGNAL
+
+import ccxt
 import pandas as pd
 import numpy as np
-from binance.client import Client
-from config import API_KEY, API_SECRET, INTERVAL, SMA_SHORT_PERIOD, SMA_LONG_PERIOD, RSI_PERIOD, ATR_PERIOD, HISTORICAL_DATA_PATH, BOLINGER_PERIOD, BOLINGER_STD_DEV
-import os
 import logging
+import os
+from dotenv import load_dotenv
+import time
+import websocket  # Using websocket-client for compatibility
+import json
+from threading import Lock, Thread
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+
+# Load environment variables
+load_dotenv()
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG, filename='logs/data_fetch.log', format='%(asctime)s - %(levelname)s - %(message)s')
-
-def calculate_rsi(data, period=RSI_PERIOD):
-    """Calculate RSI for the given price data."""
-    close = pd.to_numeric(data['close'], errors='coerce')
-    if len(close) < 2 or close.isna().all():
-        return np.full(len(data), 50.0)  # Default RSI if insufficient or invalid data
-    close = close.ffill().replace(0, np.nan)
-    delta = np.diff(close)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = np.mean(gain[:period]) if len(gain) >= period else np.mean(gain, where=~np.isnan(gain))
-    avg_loss = np.mean(loss[:period]) if len(loss) >= period else np.mean(loss, where=~np.isnan(loss))
-    rs = avg_gain / avg_loss if avg_loss > 0 else 0
-    rsi = 100 - (100 / (1 + rs)) if rs > 0 else 50.0
-    return np.full(len(data), rsi)
-
-def calculate_macd(data, fast=12, slow=26, signal=9):
-    """Calculate MACD and Signal Line for the given price data."""
-    close = pd.to_numeric(data['close'], errors='coerce')
-    if len(close) < max(fast, slow, signal) or close.isna().all():
-        return np.zeros(len(data)), np.zeros(len(data))  # Default to zeros if insufficient or invalid data
-    close = close.ffill().replace(0, np.nan)
-    exp1 = close.ewm(span=fast, adjust=False).mean()
-    exp2 = close.ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    return macd.values, signal_line.values
-
-def calculate_bollinger_bands(data, period=BOLINGER_PERIOD, std_dev=BOLINGER_STD_DEV):
-    """Calculate Bollinger Bands for the given price data (from paper recommendation)."""
-    close = pd.to_numeric(data['close'], errors='coerce')
-    if len(close) < period or close.isna().all():
-        return np.full(len(data), np.nan), np.full(len(data), np.nan)  # Default to NaN if insufficient or invalid data
-    close = close.ffill().replace(0, np.nan)
-    sma = close.rolling(window=period, min_periods=1).mean()
-    std = close.rolling(window=period, min_periods=1).std()
-    upper_band = sma + (std_dev * std)
-    lower_band = sma - (std_dev * std)
-    return upper_band.values, lower_band.values
-
-def calculate_atr(data, period=ATR_PERIOD):
-    """Calculate Average True Range for volatility."""
-    df = pd.DataFrame(data, columns=['high', 'low', 'close'])
-    df['high'] = pd.to_numeric(df['high'], errors='coerce')
-    df['low'] = pd.to_numeric(df['low'], errors='coerce')
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    if len(df) < 2 or df[['high', 'low', 'close']].isna().all().any():
-        return np.full(len(df), np.nan)  # Default to NaN if insufficient or invalid data
-    df = df.ffill().replace(0, np.nan)
-    df['tr'] = df[['high', 'low', 'close']].apply(
-        lambda row: max(row['high'] - row['low'], 
-                        abs(row['high'] - df['close'].shift().fillna(df['close']).loc[row.name]), 
-                        abs(row['low'] - df['close'].shift().fillna(df['close']).loc[row.name])), 
-        axis=1
-    )
-    return df['tr'].rolling(window=period, min_periods=1).mean().values
-
-def calculate_sma(data, short_period=SMA_SHORT_PERIOD, long_period=SMA_LONG_PERIOD):
-    """Calculate Short and Long Simple Moving Averages."""
-    close = pd.to_numeric(data['close'], errors='coerce')
-    if len(close) < max(short_period, long_period) or close.isna().all():
-        return np.full(len(data), np.nan), np.full(len(data), np.nan)  # Default to NaN if insufficient or invalid data
-    close = close.ffill().replace(0, np.nan)
-    sma_short = close.rolling(window=short_period, min_periods=1).mean()
-    sma_long = close.rolling(window=long_period, min_periods=1).mean()
-    return sma_short.values, sma_long.values
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+logging.basicConfig(
+    filename=os.path.join('logs', 'data_fetch.log'),
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class DataFetcher:
-    def __init__(self, testnet=True):
-        self.client = Client(API_KEY, API_SECRET, testnet=testnet)
-        self.historical_data = self.load_historical_data()
-
-    def load_historical_data(self):
-        """Load or initialize historical data from CSV, with fallback if file is missing or invalid, and validate data."""
+    def __init__(self):
         try:
-            if os.path.exists(HISTORICAL_DATA_PATH):
-                df = pd.read_csv(HISTORICAL_DATA_PATH)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-                df = df.dropna(subset=['timestamp', 'close'])  # Drop rows with invalid timestamps or prices
-                df = df.sort_values('timestamp')
-                # Validate that the DataFrame has non-empty, non-zero data
-                if not df.empty and 'symbol' in df.columns and not df['close'].isna().all() and not df['close'].eq(0).all():
-                    logging.info(f"Loaded valid historical data from {HISTORICAL_DATA_PATH}")
-                    return df
-                else:
-                    logging.warning(f"Invalid or empty historical data found at {HISTORICAL_DATA_PATH}, starting fresh")
-            logging.warning(f"No valid historical data file found at {HISTORICAL_DATA_PATH}, starting fresh")
-            return pd.DataFrame(columns=['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'return', 'RSI', 'MACD', 'Signal_Line', 'Upper_Band', 'Lower_Band', 'ATR', 'SMA_Short', 'SMA_Long'])
+            self.exchange = ccxt.binance({
+                'apiKey': API_KEY,
+                'secret': API_SECRET,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future', 'timeout': 30000},  # Increase timeout to 30s
+            })
+            self.exchange.set_sandbox_mode(True)
+            balance = self.get_account_balance()
+            logger.info(f"Successfully validated Binance Testnet API key. Balance: {balance} USDT")
+            print(f"DataFetcher initialized. Testnet balance: {balance} USDT")
+        except ccxt.AuthenticationError as e:
+            logger.error(f"Authentication error: {e}. Check API_KEY and API_SECRET in .env.")
+            print(f"Authentication error: {e}")
+            raise ValueError("Invalid Binance Testnet API key or secret.")
         except Exception as e:
-            logging.error(f"Error loading historical data: {e}")
-            return pd.DataFrame(columns=['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'return', 'RSI', 'MACD', 'Signal_Line', 'Upper_Band', 'Lower_Band', 'ATR', 'SMA_Short', 'SMA_Long'])
+            logger.error(f"Error initializing Binance connection: {e}")
+            print(f"Error initializing Binance: {e}")
+            raise
 
-    def save_historical_data(self, df_new):
-        """Save or append new historical data to CSV, ensuring no duplicates and handling invalid data."""
-        if df_new.empty or df_new['close'].isna().all() or df_new['close'].eq(0).all():
-            logging.warning("Attempted to save empty or invalid historical data, skipping")
-            return
-        if self.historical_data.empty:
-            self.historical_data = df_new
-        else:
-            # Ensure no duplicate timestamps per symbol, keep latest
-            self.historical_data = pd.concat([self.historical_data, df_new]).drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
-        self.historical_data = self.historical_data.sort_values('timestamp')
-        # Ensure the data directory exists
-        os.makedirs(os.path.dirname(HISTORICAL_DATA_PATH), exist_ok=True)
-        self.historical_data.to_csv(HISTORICAL_DATA_PATH, index=False)
-        logging.info(f"Saved historical data to {HISTORICAL_DATA_PATH}")
+        self.current_price = {}  # Use dict for multiple symbols
+        self.price_lock = Lock()  # Thread-safe lock for current_price
+        self.cache_timeout = 5.0  # Reduced to 5s for faster updates
+        self.ws_threads = {}  # Track WebSocket threads
+        self.ws_failure_count = {}  # Track WebSocket failures per symbol
+        self.price_history = {}  # Track recent prices for validation
+        self.last_price = {}  # Track last cached price to filter duplicates
+        self.market_data_cache = {}  # Cache for market data to minimize API calls
 
-    def get_historical_data(self, symbol, interval=INTERVAL, limit=2000, use_cache=False):  # Forced use_cache=False to bypass invalid cache
-        logging.debug(f"Attempting to fetch historical data for {symbol} with interval {interval} and limit {limit}")
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(5), retry=retry_if_exception_type((ccxt.NetworkError, ccxt.ExchangeError, ccxt.RequestTimeout)))
+    def get_historical_data(self, symbol, limit=2000, use_cache=False, since=None):
+        """Fetch historical OHLCV data with indicators for hourly data, with increased retries and timeout handling."""
         try:
-            if use_cache and not self.historical_data.empty:
-                cached_data = self.historical_data[self.historical_data['symbol'] == symbol].copy()
-                if len(cached_data) >= limit and not cached_data['close'].isna().all() and not cached_data['close'].eq(0).all():
-                    cached_data = cached_data.tail(limit).reset_index(drop=True)
-                    logging.debug(f"Using cached data for {symbol}")
-                    return self._add_indicators(cached_data)
-            else:
-                logging.warning(f"Skipping invalid or empty cached data for {symbol}, fetching fresh data")
+            if use_cache and os.path.exists(HISTORICAL_DATA_PATH):
+                df = pd.read_csv(HISTORICAL_DATA_PATH)
+                cached_df = df[df['symbol'] == symbol].copy()
+                if not cached_df.empty and len(cached_df) >= limit:
+                    logger.info(f"Loaded cached data for {symbol}")
+                    print(f"Loaded {len(cached_df)} rows of cached data for {symbol}")
+                    return self._validate_and_enrich_data(cached_df)
 
-            # Split large requests into chunks of 1000 (Binance max per request)
-            all_data = []
-            for start in range(0, limit, 1000):
-                chunk_limit = min(1000, limit - start)
-                max_retries = 5
-                for attempt in range(max_retries):
-                    try:
-                        time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
-                        klines = self.client.get_klines(symbol=symbol, interval=interval, limit=chunk_limit, startTime=None if start == 0 else int(all_data[-1]['close_time'] + 1))
-                        if not klines:
-                            logging.error(f"No data returned for {symbol} chunk {start}-{start+chunk_limit} from Binance API - check symbol, interval, or exchange status")
-                            break
-                        df_chunk = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
-                                                                'close_time', 'quote_asset_volume', 'trades',
-                                                                'taker_buy_base', 'taker_buy_quote', 'ignored'])
-                        df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], unit='ms', errors='coerce')
-                        df_chunk['symbol'] = symbol
-                        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-                        for col in numeric_cols:
-                            df_chunk[col] = pd.to_numeric(df_chunk[col], errors='coerce').replace(0, np.nan)
-                        df_chunk = df_chunk.dropna(subset=['close'])
-                        df_chunk['return'] = df_chunk['close'].pct_change().fillna(0)
-                        all_data.extend(df_chunk.to_dict('records'))
-                        break  # Exit retry loop on success
-                    except Exception as e:
-                        logging.error(f"Attempt {attempt + 1}/{max_retries} - Error fetching chunk {start}-{start+chunk_limit} for {symbol}: {e}")
-                        if attempt == max_retries - 1:
-                            return None
-            if not all_data:
-                logging.error(f"No data fetched for {symbol} - check API key, rate limits, or exchange status")
+            print(f"Fetching OHLCV data for {symbol} with limit={limit} since {since} (interval={INTERVAL})...")
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=INTERVAL, limit=limit, since=since)
+            if not ohlcv:
+                logger.error(f"No OHLCV data returned for {symbol}")
+                print(f"Error: No OHLCV data returned for {symbol}")
                 return None
 
-            df = pd.DataFrame(all_data)
-            df = self._add_indicators(df)
-            if not df.empty and not df['close'].isna().all() and not df['close'].eq(0).all():
-                self.save_historical_data(df)
+            logger.info(f"Fetched {len(ohlcv)} OHLCV data points for {symbol} (requested {limit})")
+            print(f"Fetched {len(ohlcv)} OHLCV data points for {symbol} (requested {limit})")
+            if len(ohlcv) < limit:
+                logger.warning(f"Received {len(ohlcv)} data points for {symbol}, less than requested {limit}. Proceeding anyway.")
+                print(f"Warning: Only {len(ohlcv)} data points received for {symbol}, less than {limit}")
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['symbol'] = symbol
+            print(f"Initial DataFrame created for {symbol}:\n{df.tail()}")
+
+            try:
+                print(f"Fetching order book for {symbol}...")
+                order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                df['bid_price'] = order_book['bids'][0][0] if order_book['bids'] else np.nan
+                df['ask_price'] = order_book['asks'][0][0] if order_book['asks'] else np.nan
+                df['spread'] = df['ask_price'] - df['bid_price']
+                print(f"Order book added - Bid: {df['bid_price'].iloc[-1]}, Ask: {df['ask_price'].iloc[-1]}, Spread: {df['spread'].iloc[-1]}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch order book for {symbol}: {e}")
+                print(f"Warning: Failed to fetch order book for {symbol}: {e}")
+                df[['bid_price', 'ask_price', 'spread']] = np.nan
+
+            try:
+                print(f"Fetching funding rate for {symbol}...")
+                funding_rate = self.exchange.fetch_funding_rate(symbol, params={'timeout': 30000})
+                df['funding_rate'] = funding_rate['fundingRate'] if funding_rate else 0.0
+                print(f"Funding rate added: {df['funding_rate'].iloc[-1]}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch funding rate for {symbol}: {e}")
+                print(f"Warning: Failed to fetch funding rate for {symbol}: {e}")
+                df['funding_rate'] = 0.0
+
+            print(f"Calculating indicators for {symbol}...")
+            df = self._calculate_indicators(df)
+            print(f"DataFrame after indicators:\n{df.tail()}")
+
+            df = self._validate_and_enrich_data(df)
+            print(f"DataFrame after validation:\n{df.tail()}")
+
+            if os.path.exists(HISTORICAL_DATA_PATH):
+                existing_df = pd.read_csv(HISTORICAL_DATA_PATH)
+                existing_df = pd.concat([existing_df, df]).drop_duplicates(subset=['timestamp', 'symbol'])
+            else:
+                existing_df = df
+            existing_df.to_csv(HISTORICAL_DATA_PATH, index=False)
+            logger.info(f"Saved historical data for {symbol}")
+            print(f"Saved {len(existing_df)} rows of historical data for {symbol} to {HISTORICAL_DATA_PATH}")
             return df
+
+        except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.RequestTimeout) as e:
+            logger.error(f"Network/Exchange/Timeout error fetching data for {symbol}: {e}")
+            print(f"Network/Exchange/Timeout error fetching data for {symbol}: {e}")
+            raise
         except Exception as e:
-            logging.error(f"Error fetching data for {symbol}: {e}")
+            logger.error(f"Unexpected error fetching historical data for {symbol}: {e}")
+            print(f"Unexpected error fetching historical data for {symbol}: {e}")
             return None
 
-    def _add_indicators(self, df):
-        """Add technical indicators to the DataFrame, handling invalid data with fallback for partial data."""
-        if df.empty or 'close' not in df:
-            logging.warning("Empty or invalid DataFrame in _add_indicators, returning empty")
-            return df
-        # Initialize with default values if data is insufficient, then fill with actual calculations
-        df['RSI'] = np.full(len(df), 50.0)  # Default RSI
-        df['MACD'] = np.zeros(len(df))  # Default MACD
-        df['Signal_Line'] = np.zeros(len(df))  # Default Signal Line
-        df['Upper_Band'] = np.full(len(df), np.nan)  # Default to NaN
-        df['Lower_Band'] = np.full(len(df), np.nan)  # Default to NaN
-        df['ATR'] = np.full(len(df), np.nan)  # Default to NaN
-        df['SMA_Short'] = np.full(len(df), np.nan)  # Default to NaN
-        df['SMA_Long'] = np.full(len(df), np.nan)  # Default to NaN
+    def _validate_and_enrich_data(self, df):
+        """Clean and validate DataFrame for hourly data."""
+        if df.empty:
+            logger.warning("Empty DataFrame received")
+            print("Warning: Empty DataFrame received")
+            return pd.DataFrame()
+        df['close'] = df['close'].ffill().fillna(df['close'].mean())
+        df = df.fillna(0).replace([np.inf, -np.inf], 0)
+        return df
 
-        # Calculate indicators only if data is sufficient
-        close = pd.to_numeric(df['close'], errors='coerce')
-        if len(close) >= 2 and not close.isna().all():
-            close = close.ffill().replace(0, np.nan)
-            df['RSI'] = calculate_rsi(df)
-            df['MACD'], df['Signal_Line'] = calculate_macd(df)
-            df['Upper_Band'], df['Lower_Band'] = calculate_bollinger_bands(df)
-            df['ATR'] = calculate_atr(df)
-            df['SMA_Short'], df['SMA_Long'] = calculate_sma(df)
+    def _calculate_indicators(self, df):
+        """Calculate technical indicators with length checks for hourly data."""
+        required_rows = max(SMA_SLOW_PERIOD, RSI_PERIOD, ATR_PERIOD, BOLINGER_PERIOD, MACD_SLOW)
+        if len(df) < required_rows:
+            logger.warning(f"Insufficient data ({len(df)} rows) for indicators. Need at least {required_rows}. Filling with NaN.")
+            print(f"Warning: Insufficient data ({len(df)} rows) for indicators. Need at least {required_rows}. Filling with NaN.")
+            for col in ['SMA_Fast', 'SMA_Slow', 'RSI', 'ATR', 'Upper_Band', 'Lower_Band', 'MACD', 'Signal_Line']:
+                df[col] = np.nan
+        else:
+            df['SMA_Fast'] = df['close'].rolling(window=SMA_FAST_PERIOD).mean()
+            df['SMA_Slow'] = df['close'].rolling(window=SMA_SLOW_PERIOD).mean()
+            df['RSI'] = self.calculate_rsi(df['close'])
+            df['ATR'] = self.calculate_atr(df['high'], df['low'], df['close'])
+            df['Upper_Band'], df['Lower_Band'] = self.calculate_bollinger_bands(df['close'])
+            df['MACD'], df['Signal_Line'] = self.calculate_macd(df['close'])
+        return df
 
-        # Drop rows with NaN values, but ensure at least some data is kept if possible
-        df_clean = df.dropna(subset=['close'])
-        if df_clean.empty:
-            logging.warning("All rows dropped due to NaN values in _add_indicators, returning original df with defaults")
-            return df  # Return original df with defaults if all rows are dropped
+    def get_current_price(self, symbol):
+        """Get real-time price via WebSocket or fallback to REST with improved reliability, longer timeout, and more retries for hourly data."""
+        try:
+            if symbol not in self.ws_failure_count:
+                self.ws_failure_count[symbol] = 0
 
-        # Replace zeros with NaN and ensure numeric precision
-        df_clean = df_clean.replace(0, np.nan)
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'RSI', 'MACD', 'Signal_Line', 'Upper_Band', 'Lower_Band', 'ATR', 'SMA_Short', 'SMA_Long']
-        for col in numeric_cols:
-            if col in df_clean.columns:
-                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-        df_clean = df_clean.dropna()
+            # Try WebSocket first for real-time data, reducing cache reliance
+            if symbol not in self.current_price or time.time() - self.current_price.get(f"{symbol}_timestamp", 0) > self.cache_timeout:
+                self._setup_websocket(symbol)
+                price = self.current_price.get(symbol)
+                if price is None or time.time() - self.current_price.get(f"{symbol}_timestamp", 0) > self.cache_timeout:
+                    raise ValueError("No recent price from WebSocket")
 
-        logging.debug(f"Indicators added, final shape: {df_clean.shape}, sample close: {df_clean['close'].head()}")
-        return df_clean
-
-    def get_multi_timeframe_data(self, symbol, intervals=['1m', '5m', '15m'], limit=2000):
-        """Fetch historical data for multiple timeframes."""
-        data = {}
-        for interval in intervals:
-            df = self.get_historical_data(symbol, interval=interval, limit=limit, use_cache=False)  # Force fresh data for multi-timeframe
-            if df is not None and not df.empty:
-                data[interval] = df
-        return data
-
-    def get_current_price(self, symbol, retries=5):
-        """Get the current ticker price for a symbol with enhanced retry logic, handling invalid data."""
-        for attempt in range(retries):
-            try:
-                time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
-                price = float(self.client.get_symbol_ticker(symbol=symbol)["price"])
-                if price > 0:
+                # Validate against order book
+                order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                best_bid = float(order_book['bids'][0][0]) if order_book['bids'] and order_book['bids'][0][0] else None
+                best_ask = float(order_book['asks'][0][0]) if order_book['asks'] and order_book['asks'][0][0] else None
+                if best_bid and best_ask:
+                    if not (best_bid * 0.8 <= price <= best_ask * 1.2):  # 20% deviation
+                        logger.warning(f"Invalid WebSocket price for {symbol}: {price}. Using order book median.")
+                        price = (best_bid + best_ask) / 2
+                logger.debug(f"Current price for {symbol} (WebSocket): {price}")
+                print(f"Current price for {symbol} (WebSocket): {price}")
+                self._cache_price(symbol, price)
+                self.ws_failure_count[symbol] = 0  # Reset failure count on success
+                return price
+            else:
+                price = self.current_price.get(symbol)
+                if time.time() - self.current_price.get(f"{symbol}_timestamp", 0) <= self.cache_timeout:
                     return price
-                logging.warning(f"Zero price for {symbol} on attempt {attempt + 1}")
+
+            # Fallback to cached price only if WebSocket fails immediately
+            cached_price = self._get_cached_price(symbol)
+            if cached_price and time.time() - cached_price['timestamp'] < self.cache_timeout:
+                price = cached_price['price']
+                order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                best_bid = float(order_book['bids'][0][0]) if order_book['bids'] and order_book['bids'][0][0] else None
+                best_ask = float(order_book['asks'][0][0]) if order_book['asks'] and order_book['asks'][0][0] else None
+                if best_bid and best_ask and not (best_bid * 0.8 <= price <= best_ask * 1.2):
+                    logger.warning(f"Invalid cached price for {symbol}: {price}. Refreshing from REST.")
+                    return self._poll_price(symbol)
+                logger.debug(f"Using cached price for {symbol}: {price}")
+                print(f"Using cached price for {symbol}: {price}")
+                return price
+
+        except Exception as e:
+            self.ws_failure_count[symbol] = self.ws_failure_count.get(symbol, 0) + 1
+            logger.error(f"WebSocket failed for {symbol} (attempt {self.ws_failure_count[symbol]}): {e}. Falling back to REST API.")
+            print(f"WebSocket failed for {symbol} (attempt {self.ws_failure_count[symbol]}): {e}. Falling back to REST API.")
+
+            # Fallback to REST with polling, longer timeout, and more retries
+            backoff_time = min(2 ** (self.ws_failure_count[symbol] - 1), 20)  # Increase max backoff to 20s
+            if self.ws_failure_count[symbol] > 5:  # Switch to polling after 5 failures
+                logger.warning(f"Switching to REST polling for {symbol} after {self.ws_failure_count[symbol]} WebSocket failures. Waiting {backoff_time}s...")
+                time.sleep(backoff_time)
+                return self._poll_price(symbol)
+
+            return self._poll_price(symbol)
+
+    def _setup_websocket(self, symbol):
+        """Set up WebSocket for real-time price updates in a thread, with increased retry attempts, robust timeout handling, and stability for hourly data."""
+        if symbol in self.ws_threads and self.ws_threads[symbol].is_alive():
+            return
+
+        def websocket_thread():
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    if 'b' in data and 'a' in data and 's' in data:  # @bookTicker format: 'b' (bid), 'a' (ask), 's' (symbol)
+                        mid_price = (float(data['b']) + float(data['a'])) / 2  # Use mid-price
+                        with self.price_lock:
+                            # Only update if price differs by more than 0.0001 (or a small threshold)
+                            if symbol not in self.last_price or abs(self.last_price[symbol] - mid_price) > 0.0001:
+                                self.current_price[data['s']] = mid_price
+                                self.current_price[f"{data['s']}_timestamp"] = time.time()
+                                self.last_price[symbol] = mid_price
+                                logger.debug(f"WebSocket update: {data['s']} price = {mid_price}")
+                                print(f"WebSocket update: {data['s']} price = {mid_price}")
+                                self._cache_price(data['s'], mid_price)
+                except Exception as e:
+                    logger.error(f"Error processing WebSocket message for {symbol}: {e}")
+                    ws.close()
+
+            def on_error(ws, error):
+                logger.error(f"WebSocket error for {symbol}: {error}")
+                print(f"WebSocket error for {symbol}: {error}")
+                ws.close()
+
+            def on_close(ws, code, reason):
+                logger.warning(f"WebSocket closed for {symbol}: {code} - {reason}")
+                print(f"WebSocket closed for {symbol}: {code} - {reason}")
+                # Attempt to reconnect after a delay with exponential backoff
+                backoff = min(2 ** (self.ws_failure_count.get(symbol, 0) - 1), 20)  # Increase max backoff to 20s
+                time.sleep(backoff)
+                self._setup_websocket(symbol)  # Retry connection with robust timeout handling
+
+            def on_open(ws):
+                logger.info(f"WebSocket connected for {symbol}")
+                print(f"WebSocket connected for {symbol}")
+                ws.send(json.dumps({"method": "SUBSCRIBE", "params": [f"{symbol.lower()}@bookTicker"], "id": 1}))
+
+            ws_url = "wss://testnet.binance.vision/ws"
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open
+            )
+            try:
+                # Remove unsupported 'timeout' parameter and implement a custom timeout loop
+                start_time = time.time()
+                while time.time() - start_time < 300:  # 5-minute timeout as a fallback
+                    ws.run_forever(ping_interval=30)  # Use ping_interval for periodic checks
+                    if not ws.sock or ws.sock.closed:
+                        break
+                    time.sleep(1)  # Small delay to prevent tight looping
+                logger.warning(f"WebSocket for {symbol} timed out after 300s, attempting reconnect...")
             except Exception as e:
-                logging.error(f"Attempt {attempt + 1}/{retries} - Error getting price for {symbol}: {e}")
-                if attempt == retries - 1:
-                    return None
+                logger.error(f"WebSocket thread crashed for {symbol}: {e}")
+                ws.close()
+
+        thread = Thread(target=websocket_thread, daemon=True)
+        thread.start()
+        self.ws_threads[symbol] = thread
+        time.sleep(2)  # Give WebSocket time to connect
+
+    def _poll_price(self, symbol):
+        """Poll price via REST API with exponential backoff, longer timeout, and more retries, minimizing calls for hourly data."""
+        max_attempts = 10  # Increase retries to handle Testnet instability
+        for attempt in range(max_attempts):
+            try:
+                ticker = self.exchange.fetch_ticker(symbol, params={'timeout': 30000})  # Increase REST API timeout to 30s
+                price = float(ticker['last']) if ticker['last'] is not None else None
+                if price is None:
+                    raise ValueError("Ticker last price is None")
+                # Validate against order book, but cache to avoid repeated calls
+                if symbol not in self.market_data_cache or time.time() - self.market_data_cache[symbol]['timestamp'] > 10.0:
+                    order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                    best_bid = float(order_book['bids'][0][0]) if order_book['bids'] and order_book['bids'][0][0] else None
+                    best_ask = float(order_book['asks'][0][0]) if order_book['asks'] and order_book['asks'][0][0] else None
+                    self.market_data_cache[symbol] = {'best_bid': best_bid, 'best_ask': best_ask, 'timestamp': time.time()}
+                else:
+                    best_bid = self.market_data_cache[symbol]['best_bid']
+                    best_ask = self.market_data_cache[symbol]['best_ask']
+                
+                if best_bid and best_ask and not (best_bid * 0.8 <= price <= best_ask * 1.2):
+                    raise ValueError(f"Invalid REST price for {symbol}: {price}")
+                self._cache_price(symbol, price)
+                logger.debug(f"REST API price for {symbol} (poll): {price}")
+                print(f"REST API price for {symbol} (poll): {price}")
+                return price
+            except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.RequestTimeout) as e:
+                wait_time = min(2 ** attempt, 20)  # Increase max backoff to 20s
+                logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed to poll price for {symbol}: {e}. Waiting {wait_time}s...")
+                print(f"Attempt {attempt + 1}/{max_attempts} failed to poll price for {symbol}: {e}. Waiting {wait_time}s...")
+                time.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Unexpected error polling price for {symbol}: {e}")
+                print(f"Unexpected error polling price for {symbol}: {e}")
+                time.sleep(20)  # Default backoff for unexpected errors
+        logger.error(f"Failed to poll price for {symbol} after {max_attempts} attempts. Returning None.")
         return None
 
-    def get_lot_size(self, symbol):
-        """Get step size for quantity adjustment."""
+    def _validate_price(self, symbol, price):
+        """Validate price against order book and historical data, ensuring it reflects current market conditions for hourly data."""
         try:
-            symbol_info = self.client.get_symbol_info(symbol)
-            lot_size_filter = next(filter(lambda x: x['filterType'] == 'LOT_SIZE', symbol_info['filters']), None)
-            return float(lot_size_filter['stepSize'])
-        except Exception as e:
-            logging.error(f"Error getting lot size for {symbol}: {e}")
-            return None
+            if symbol in self.market_data_cache and time.time() - self.market_data_cache[symbol]['timestamp'] < 10.0:
+                best_bid = self.market_data_cache[symbol]['best_bid']
+                best_ask = self.market_data_cache[symbol]['best_ask']
+            else:
+                order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                best_bid = float(order_book['bids'][0][0]) if order_book['bids'] and order_book['bids'][0][0] else None
+                best_ask = float(order_book['asks'][0][0]) if order_book['asks'] and order_book['asks'][0][0] else None
+                self.market_data_cache[symbol] = {'best_bid': best_bid, 'best_ask': best_ask, 'timestamp': time.time()}
 
-    def get_sentiment(self, symbol):
-        """Fetch sentiment for a symbol (simplified, using NewsAPI or placeholder)."""
-        try:
-            from sentiment import SentimentAnalyzer
-            analyzer = SentimentAnalyzer()
-            return analyzer.get_sentiment(symbol)
+            if best_bid and best_ask:
+                price_range = (best_bid * 0.8, best_ask * 1.2)  # 20% deviation
+                if not (price_range[0] <= price <= price_range[1]):
+                    logger.warning(f"Unrealistic price for {symbol}: {price}. Using median of bid/ask: {(best_bid + best_ask) / 2}")
+                    return (best_bid + best_ask) / 2 if best_bid and best_ask else price
+            return price
         except Exception as e:
-            logging.error(f"Error fetching sentiment for {symbol}: {e}")
-            return 0.0  # Default neutral sentiment
+            logger.warning(f"Failed to validate price for {symbol}: {e}. Returning original price: {price}")
+            return price
+
+    def _get_cached_price(self, symbol):
+        """Retrieve cached price if available and validate it against recent data for hourly data."""
+        cache_file = os.path.join('data', f'price_cache_{symbol}.json')
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                cache = json.load(f)
+                if 'price' in cache and 'timestamp' in cache and time.time() - cache['timestamp'] < self.cache_timeout:
+                    # Validate cached price against order book (use cached order book if recent)
+                    if symbol in self.market_data_cache and time.time() - self.market_data_cache[symbol]['timestamp'] < 10.0:
+                        best_bid = self.market_data_cache[symbol]['best_bid']
+                        best_ask = self.market_data_cache[symbol]['best_ask']
+                    else:
+                        order_book = self.exchange.fetch_order_book(symbol, limit=10, params={'timeout': 30000})
+                        best_bid = float(order_book['bids'][0][0]) if order_book['bids'] and order_book['bids'][0][0] else None
+                        best_ask = float(order_book['asks'][0][0]) if order_book['asks'] and order_book['asks'][0][0] else None
+                        self.market_data_cache[symbol] = {'best_bid': best_bid, 'best_ask': best_ask, 'timestamp': time.time()}
+                    
+                    if best_bid and best_ask:
+                        if best_bid * 0.8 <= cache['price'] <= best_ask * 1.2:
+                            return {'price': cache['price'], 'timestamp': cache['timestamp']}
+                    logger.warning(f"Stale or invalid cached price for {symbol}: {cache['price']}")
+        return None
+
+    def _cache_price(self, symbol, price):
+        """Cache price to file with timestamp, ensuring it’s recent and valid for hourly data."""
+        cache_file = os.path.join('data', f'price_cache_{symbol}.json')
+        if not os.path.exists('data'):
+            os.makedirs('data')
+        with open(cache_file, 'w') as f:
+            json.dump({'price': price, 'timestamp': time.time()}, f)
+        logger.debug(f"Cached price for {symbol}: {price}")
+
+    def calculate_rsi(self, prices, period=RSI_PERIOD):
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def calculate_atr(self, highs, lows, closes, period=ATR_PERIOD):
+        tr = pd.DataFrame({'high': highs, 'low': lows, 'close': closes})
+        tr['prev_close'] = tr['close'].shift(1)
+        tr['tr'] = tr.apply(
+            lambda row: max(row['high'] - row['low'],
+                           abs(row['high'] - row['prev_close']) if pd.notna(row['prev_close']) else 0,
+                           abs(row['low'] - row['prev_close']) if pd.notna(row['prev_close']) else 0), axis=1)
+        return tr['tr'].rolling(window=period).mean()
+
+    def calculate_bollinger_bands(self, prices, period=BOLINGER_PERIOD, std_dev=BOLINGER_STD_DEV):
+        sma = prices.rolling(window=period).mean()
+        rolling_std = prices.rolling(window=period).std()
+        upper_band = sma + (rolling_std * std_dev)
+        lower_band = sma - (rolling_std * std_dev)
+        return upper_band, lower_band
+
+    def calculate_macd(self, prices):
+        exp1 = prices.ewm(span=MACD_FAST, adjust=False).mean()
+        exp2 = prices.ewm(span=MACD_SLOW, adjust=False).mean()
+        macd = exp1 - exp2
+        signal_line = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
+        return macd, signal_line
+
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(5), retry=retry_if_exception_type((ccxt.NetworkError, ccxt.ExchangeError, ccxt.RequestTimeout)))
+    def get_account_balance(self):
+        """Fetch current USDT wallet balance from Binance Testnet with retry, longer timeout, and more robust error handling."""
+        try:
+            account = self.exchange.fetch_balance(params={'timeout': 30000})
+            wallet_balance = float(account['USDT']['free'])  # Free balance
+            total_balance = float(account['total']['USDT'])  # Total balance including unrealized P/L
+            if total_balance <= 0:
+                raise ValueError("No valid USDT balance available")
+            logger.info(f"Fetched account balance: {total_balance} USDT (Wallet: {wallet_balance}, Total: {total_balance})")
+            print(f"Fetched account balance: {total_balance} USDT (Wallet: {wallet_balance}, Total: {total_balance})")
+            return total_balance
+        except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.RequestTimeout) as e:
+            logger.error(f"Network/Exchange/Timeout error fetching balance: {e}")
+            print(f"Network/Exchange/Timeout error fetching balance: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}")
+            print(f"Error fetching balance: {e}")
+            raise
+
+if __name__ == "__main__":
+    fetcher = DataFetcher()
+    df = fetcher.get_historical_data('BTC/USDT')
+    if df is not None:
+        print("Final DataFrame:\n", df.tail())
+    price = fetcher.get_current_price('BTC/USDT')
+    print(f"Final current price: {price}")

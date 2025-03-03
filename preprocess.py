@@ -1,102 +1,75 @@
-# preprocess.py
-import numpy as np
+# preprocess.py (Updated)
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from config import LOOKBACK, HISTORICAL_DATA_PATH
-import os
+from config import LOOKBACK
 
 class Preprocessor:
     def __init__(self):
         self.scaler = MinMaxScaler()
-        self.historical_data = self.load_historical_data()
-        self.is_fitted = False  # Track if scaler is fitted
+        self.scaled_data = {}
 
-    def load_historical_data(self):
-        """Load historical data from CSV for preprocessing."""
-        if os.path.exists(HISTORICAL_DATA_PATH):
-            try:
-                df = pd.read_csv(HISTORICAL_DATA_PATH)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                return df
-            except Exception as e:
-                print(f"Error loading historical data: {e}")
-                return pd.DataFrame()
-        return pd.DataFrame()
+    def prepare_training_data(self, df, lookback=LOOKBACK):
+        """Prepare training data for LSTM, handling hourly data."""
+        if df.empty or 'close' not in df.columns:
+            return None, None, None
+        features = ['open', 'high', 'low', 'close', 'volume', 'bid_price', 'ask_price', 'spread', 'funding_rate', 'SMA_Fast', 'SMA_Slow', 'RSI', 'ATR', 'Upper_Band', 'Lower_Band', 'MACD', 'Signal_Line']
+        df = df.dropna(subset=features)  # Drop rows with NaN in features
+        if len(df) < lookback:
+            return None, None, None
 
-    def fit_scaler(self, data):
-        """Fit the scaler with training data and mark as fitted."""
-        if data.size > 0:  # Ensure data is not empty
-            self.scaler.fit(data)
-            self.is_fitted = True
+        # Normalize features for hourly data
+        data = df[features].values
+        scaled_data = self.scaler.fit_transform(data)
+        self.scaled_data[df['symbol'].iloc[0]] = self.scaler  # Store scaler for inverse transform
+
+        X, y = self._create_sequences(scaled_data, lookback)
+        return X, y, df['symbol'].iloc[0]
+
+    def prepare_prediction_data(self, df, lookback=LOOKBACK):
+        """Prepare prediction data for LSTM, handling hourly data, ensuring a valid NumPy array is returned."""
+        if df.empty or 'close' not in df.columns:
+            return np.array([])  # Return empty NumPy array for invalid data
+        features = ['open', 'high', 'low', 'close', 'volume', 'bid_price', 'ask_price', 'spread', 'funding_rate', 'SMA_Fast', 'SMA_Slow', 'RSI', 'ATR', 'Upper_Band', 'Lower_Band', 'MACD', 'Signal_Line']
+        df = df.dropna(subset=features)
+        if len(df) < lookback:
+            return np.zeros((1, lookback, len(features)))  # Return a zero-filled array for insufficient data
+
+        data = df[features].values
+        if df['symbol'].iloc[0] in self.scaled_data:
+            scaled_data = self.scaled_data[df['symbol'].iloc[0]].transform(data)
         else:
-            print("Warning: Empty data provided to fit_scaler, scaler not fitted")
+            scaled_data = self.scaler.fit_transform(data)
+            self.scaled_data[df['symbol'].iloc[0]] = self.scaler
 
-    def prepare_training_data(self, df):
-        """Prepare data for LSTM training with price, volume, RSI, MACD, Bollinger Bands, ATR, and SMAs, using historical data if available."""
-        if df.empty:
-            df = self.historical_data
-        if df.empty or 'close' not in df or df['close'].isna().any():
-            return np.array([]), np.array([])
+        X = self._create_sequences(scaled_data, lookback)
+        if isinstance(X, tuple) and len(X) == 2:  # Ensure X is not a tuple
+            return X[0] if X[0].size > 0 else np.zeros((1, lookback, len(features)))  # Return X or default array
+        return X if X.size > 0 else np.zeros((1, lookback, len(features)))  # Ensure X is a valid NumPy array
 
-        prices = df['close'].values.reshape(-1, 1)
-        volumes = df['volume'].values.reshape(-1, 1)
-        rsi = df['RSI'].values.reshape(-1, 1)
-        macd = df['MACD'].values.reshape(-1, 1)
-        upper_band = df['Upper_Band'].values.reshape(-1, 1)
-        lower_band = df['Lower_Band'].values.reshape(-1, 1)
-        atr = df['ATR'].values.reshape(-1, 1)
-        sma_short = df['SMA_Short'].values.reshape(-1, 1)
-        sma_long = df['SMA_Long'].values.reshape(-1, 1)
-
-        # Scale all features together
-        features = np.column_stack((prices, volumes, rsi, macd, upper_band, lower_band, atr, sma_short, sma_long))
-        if not self.is_fitted:
-            self.fit_scaler(features)  # Fit scaler if not already fitted
-        scaled_features = self.scaler.transform(features)
+    def _create_sequences(self, data, lookback):
+        """Create sequences for LSTM training/prediction with hourly data."""
+        if len(data) < lookback + 1:
+            return np.array([]), np.array([])  # Return empty arrays if data is insufficient
         X, y = [], []
-        for i in range(LOOKBACK, len(scaled_features) - 5):
-            X.append(scaled_features[i - LOOKBACK:i])
-            future_price = scaled_features[i + 5, 0]  # Use only price for target
-            y.append(1 if future_price >= scaled_features[i - 1, 0] * 1.10 else 0)  # Target 10% gain
+        for i in range(len(data) - lookback):
+            X.append(data[i:(i + lookback)])
+            y.append(data[i + lookback, 3])  # Use 'close' price as target (index 3 for hourly features)
         return np.array(X), np.array(y)
 
-    def prepare_prediction_data(self, df):
-        """Prepare data for LSTM prediction with all features, using historical data if available."""
-        if df.empty:
-            df = self.historical_data.tail(LOOKBACK)
-        if df.empty or 'close' not in df or len(df) < LOOKBACK:
-            return np.zeros((1, LOOKBACK, 9))
+    def inverse_transform(self, scaled_value, symbol):
+        """Inverse transform a scaled value to original scale for a specific symbol for hourly data."""
+        if symbol in self.scaled_data:
+            scaled_array = np.zeros((1, len(self.scaled_data[symbol].scale_)))
+            scaled_array[0, 3] = scaled_value  # 'close' index
+            return self.scaled_data[symbol].inverse_transform(scaled_array)[0, 3]
+        return scaled_value
 
-        prices = df['close'].values[-LOOKBACK:].reshape(-1, 1)
-        volumes = df['volume'].values[-LOOKBACK:].reshape(-1, 1)
-        rsi = df['RSI'].values[-LOOKBACK:].reshape(-1, 1)
-        macd = df['MACD'].values[-LOOKBACK:].reshape(-1, 1)
-        upper_band = df['Upper_Band'].values[-LOOKBACK:].reshape(-1, 1)
-        lower_band = df['Lower_Band'].values[-LOOKBACK:].reshape(-1, 1)
-        atr = df['ATR'].values[-LOOKBACK:].reshape(-1, 1)
-        sma_short = df['SMA_Short'].values[-LOOKBACK:].reshape(-1, 1)
-        sma_long = df['SMA_Long'].values[-LOOKBACK:].reshape(-1, 1)
-
-        features = np.column_stack((prices, volumes, rsi, macd, upper_band, lower_band, atr, sma_short, sma_long))
-        if not self.is_fitted:
-            print("Warning: MinMaxScaler not fitted, using zeros for prediction")
-            return np.zeros((1, LOOKBACK, 9))  # Return zeros if scaler not fitted
-        scaled_features = self.scaler.transform(features)
-        return np.array([scaled_features])
-
-    def save_scaler(self, path):
-        """Save the fitted scaler."""
-        import pickle
-        with open(path, 'wb') as f:
-            pickle.dump(self.scaler, f)
-
-    def load_scaler(self, path):
-        """Load a pre-fitted scaler and mark as fitted."""
-        import pickle
-        try:
-            with open(path, 'rb') as f:
-                self.scaler = pickle.load(f)
-                self.is_fitted = True
-        except Exception as e:
-            print(f"Error loading scaler: {e}")
-            self.is_fitted = False
+if __name__ == "__main__":
+    from fetch_data import DataFetcher
+    fetcher = DataFetcher()
+    df = fetcher.get_historical_data('XRPUSDT', limit=LOOKBACK)
+    preprocessor = Preprocessor()
+    X, y, _ = preprocessor.prepare_training_data(df)
+    if X is not None and y is not None and X.size > 0 and y.size > 0:
+        print(f"Training data shape: {X.shape}, Target shape: {y.shape}")

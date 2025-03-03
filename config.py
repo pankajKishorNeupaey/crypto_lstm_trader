@@ -1,25 +1,55 @@
 # config.py
-API_KEY = "your_binance_testnet_api_key"  # Replace with your Binance Testnet API key
-API_SECRET = "your_binance_testnet_api_secret"  # Replace with your Binance Testnet API secret
-SYMBOLS = ["DOGEUSDT", "XRPUSDT", "ADAUSDT", "SOLUSDT"]  # Focus on volatile USDT pairs
-BALANCE = 12  # Starting balance in USDT (~1,000 INR at 1 INR = 0.012 USDT, verify current rate on March 1, 2025)
-RUNTIME = 900  # Runtime in seconds (15 minutes for more opportunities)
-INTERVAL = "1m"  # Data interval (1 minute)
-LOOKBACK = 18  # Lookback period for LSTM (increased for better pattern capture)
-PRED_THRESHOLD = 0.3  # Base threshold for trades, lowered for more opportunities on March 1, 2025
-TAKE_PROFIT_BASE = 0.10  # Base take-profit (10%) for dynamic adjustment
-STOP_LOSS_BASE = -0.03  # Base stop-loss (-3%) for dynamic adjustment
-MODEL_PATH = "models/lstm_model.keras"  # Path to the LSTM model file
-SCALER_PATH = "models/scaler.pkl"  # Path to the scaler file
-LOG_FILE = "logs/training.log"  # Path to the log file for training
-TRADING_LOG = "logs/trading.log"  # Path to the log file for trades
-NEWS_API_KEY = "your_newsapi_key"  # Replace with your News API key for sentiment (optional)
-INR_TO_USDT_RATE = 0.012  # Approximate conversion rate (1 INR = 0.012 USDT, verify current rate on March 1, 2025)
-SMA_SHORT_PERIOD = 10  # Short SMA for trend detection
-SMA_LONG_PERIOD = 50  # Long SMA for trend detection
-RSI_PERIOD = 14  # RSI period for momentum
-ATR_PERIOD = 14  # ATR period for volatility
-RISK_FREE_RATE = 0.01  # Risk-free rate for Sharpe Ratio
-HISTORICAL_DATA_PATH = "data/historical_data.csv"  # Path to store historical data
-BOLINGER_PERIOD = 20  # Period for Bollinger Bands (from paper recommendation)
-BOLINGER_STD_DEV = 2  # Standard deviation for Bollinger Bands
+import os
+
+# Base directory for relative paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# API Keys (hardcoded for Testnet—move to .env for production)
+API_KEY = "1f8f62020e5f67aa5ef0a832ae01c8e2947273c75ef2962b974badd6bca881c4"
+API_SECRET = "df5300bc019fcbd16ec23d126e695f47305fddc7189ef3b0b0e27d75096c496d"
+NEWS_API_KEY = "501433d26a9345a18e885f854ff9c742"
+TWITTER_API_KEY = "your_twitter_api_key"
+TWITTER_API_SECRET = "your_twitter_api_secret"
+
+# Trading Configuration
+SYMBOLS = ["ETHUSDT", "ADAUSDT", "XRPUSDT", "SOLUSDT"]  # Ensure all symbols are listed
+RUNTIME = 86400  # Runtime in seconds (24 hours for testing)
+INTERVAL = "1h"  # Data interval (1 hour)
+LOOKBACK = 240  # Lookback period for LSTM (4 hours at 1h intervals)
+PRED_THRESHOLD = 0.1  # Prediction threshold for trades (lowered for volatile assets like SOLUSDT)
+TAKE_PROFIT_BASE = 0.02  # Take-profit (2%)
+STOP_LOSS_BASE = -0.01  # Stop-loss (-1%)
+INR_TO_USDT_RATE = 0.011  # Conversion rate (1 USDT = 90.91 INR, updated for March 2025)
+# Technical Indicator Settings
+SMA_FAST_PERIOD = 9
+SMA_SLOW_PERIOD = 50
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+BOLINGER_PERIOD = 20
+BOLINGER_STD_DEV = 2
+MACD_FAST = 12  # MACD fast period
+MACD_SLOW = 26  # MACD slow period
+MACD_SIGNAL = 9  # MACD signal period
+RISK_FREE_RATE = 0.01
+
+# File Paths (absolute)
+MODEL_PATH = os.path.join(BASE_DIR, "models", "lstm_model.keras")
+SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.pkl")
+LOG_FILE = os.path.join(BASE_DIR, "logs", "training.log")
+TRADING_LOG = os.path.join(BASE_DIR, "logs", "trading.log")
+HISTORICAL_DATA_PATH = os.path.join(BASE_DIR, "data", "historical_data.csv")
+
+# Trading Limits
+MAX_TRADES_PER_SESSION = 5
+TRADE_WINDOW_START = None  # Remove time window for 24/7 testing on Testnet
+TRADE_WINDOW_END = None
+
+# Advanced validation
+if LOOKBACK <= 0:
+    raise ValueError("LOOKBACK must be positive")
+if INR_TO_USDT_RATE <= 0:
+    raise ValueError("INR_TO_USDT_RATE must be positive")
+if PRED_THRESHOLD < 0 or PRED_THRESHOLD > 1:
+    raise ValueError("PRED_THRESHOLD must be between 0 and 1")
+if TAKE_PROFIT_BASE <= 0 or STOP_LOSS_BASE >= 0:
+    raise ValueError("TAKE_PROFIT_BASE must be positive and STOP_LOSS_BASE must be negative")
