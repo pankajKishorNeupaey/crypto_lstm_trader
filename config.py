@@ -4,10 +4,10 @@ import os
 # Base directory for relative paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# API Keys (hardcoded for Testnet—move to .env for production)
-API_KEY = "1f8f62020e5f67aa5ef0a832ae01c8e2947273c75ef2962b974badd6bca881c4"
-API_SECRET = "df5300bc019fcbd16ec23d126e695f47305fddc7189ef3b0b0e27d75096c496d"
-NEWS_API_KEY = "501433d26a9345a18e885f854ff9c742"
+# API Keys (hardcoded for Testnetâ€”move to .env for production)
+API_KEY = "API_KEY"
+API_SECRET = "API_SECRET"
+NEWS_API_KEY = "NEWS_API_KEY"
 TWITTER_API_KEY = "your_twitter_api_key"
 TWITTER_API_SECRET = "your_twitter_api_secret"
 
